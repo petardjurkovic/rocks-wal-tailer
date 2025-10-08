@@ -6,7 +6,7 @@ use rocks_wal_tailer::{run_single_src, Src, TailArgs};
 #[tokio::test(flavor = "multi_thread")]
 async fn wal_to_clickhouse_discovery_end_to_end() {
     let ch_url = "http://127.0.0.1:8123".to_string();
-    let client = Client::default().with_url(&ch_url);
+    let client = Client::default().with_url(&ch_url).with_user("default").with_password("default123");
 
     // --- Schema: source (EmbeddedRocksDB) and destination (MergeTree) ---
     client.query("CREATE DATABASE IF NOT EXISTS srcdb").execute().await.unwrap();
@@ -21,6 +21,7 @@ async fn wal_to_clickhouse_discovery_end_to_end() {
         )
         ENGINE = EmbeddedRocksDB
         PRIMARY KEY key
+        SETTINGS optimize_for_bulk_insert = 0;
     "#).execute().await.unwrap();
 
     // Destination with src_db/src_table columns
@@ -74,9 +75,9 @@ async fn wal_to_clickhouse_discovery_end_to_end() {
             .execute().await.unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(10000)).await;
     client.query("INSERT INTO srcdb.kv (key, value) VALUES ('user:3','Z')").execute().await.unwrap();
-
+    tokio::time::sleep(Duration::from_millis(10000)).await;
     let mut total = 0u64;
     for _ in 0..80 {
         let cnt: u64 = client
