@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rocksdb = "0.24.0"
+rocksdb =  { version = "0.24", default-features = false, features = [
+"zstd",
+"lz4",
+"snappy",
+"zlib"
+] }
+
 clickhouse = { version = "0.13.3", features = ["lz4", "chrono", "rustls-tls"] }
 tokio     = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }

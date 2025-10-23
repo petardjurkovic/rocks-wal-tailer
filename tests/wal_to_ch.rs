@@ -109,8 +109,9 @@ async fn wal_to_clickhouse_discovery_end_to_end_with_op_counts() {
 
     client.query("DROP TABLE IF EXISTS wal.rdb_changelog").execute().await.unwrap();
     client.query(r#"
-        CREATE TABLE wal.rdb_changelog
-        (
+      CREATE TABLE wal.rdb_changelog
+      (
+          node_id    String,
           src_db     String,
           src_table  String,
           ts         DateTime64(3) DEFAULT now64(3),
@@ -119,10 +120,10 @@ async fn wal_to_clickhouse_discovery_end_to_end_with_op_counts() {
           is_deleted UInt8,
           value_b64  Nullable(String),
           value_json Nullable(String)
-        )
-        ENGINE = MergeTree
-        PARTITION BY toDate(ts)
-        ORDER BY (src_db, src_table, key, seq)
+      )
+      ENGINE = MergeTree
+          PARTITION BY toDate(ts)
+          ORDER BY (seq, src_db, src_table, node_id);
     "#).execute().await.unwrap();
 
     let ckpt_dir = TempDir::new().unwrap();
@@ -132,6 +133,7 @@ async fn wal_to_clickhouse_discovery_end_to_end_with_op_counts() {
         ch_url: ch_url.clone(),
         ch_database: "wal".into(),
         ch_table: "rdb_changelog".into(),
+        node_id: Some("node1".to_string())
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -270,8 +272,9 @@ async fn wal_to_clickhouse_multi_tables_stream_ok() {
 
     client.query("DROP TABLE IF EXISTS wal.rdb_changelog").execute().await.unwrap();
     client.query(r#"
-        CREATE TABLE wal.rdb_changelog
-        (
+      CREATE TABLE wal.rdb_changelog
+      (
+          node_id    String,
           src_db     String,
           src_table  String,
           ts         DateTime64(3) DEFAULT now64(3),
@@ -280,10 +283,10 @@ async fn wal_to_clickhouse_multi_tables_stream_ok() {
           is_deleted UInt8,
           value_b64  Nullable(String),
           value_json Nullable(String)
-        )
-        ENGINE = MergeTree
-        PARTITION BY toDate(ts)
-        ORDER BY (src_db, src_table, key, seq)
+      )
+      ENGINE = MergeTree
+          PARTITION BY toDate(ts)
+          ORDER BY (seq, src_db, src_table, node_id);
     "#).execute().await.unwrap();
 
     // Tailer args
@@ -299,6 +302,7 @@ async fn wal_to_clickhouse_multi_tables_stream_ok() {
         ch_url: ch_url.clone(),
         ch_database: "wal".into(),
         ch_table: "rdb_changelog".into(),
+        node_id: Some("node1".to_string())
     };
 
     // Spawn two tailers
@@ -431,8 +435,9 @@ async fn wal_resume_from_checkpoint_using_helpers() {
 
     client.query("DROP TABLE IF EXISTS wal.rdb_changelog").execute().await.unwrap();
     client.query(r#"
-        CREATE TABLE wal.rdb_changelog
-        (
+      CREATE TABLE wal.rdb_changelog
+      (
+          node_id    String,
           src_db     String,
           src_table  String,
           ts         DateTime64(3) DEFAULT now64(3),
@@ -441,10 +446,10 @@ async fn wal_resume_from_checkpoint_using_helpers() {
           is_deleted UInt8,
           value_b64  Nullable(String),
           value_json Nullable(String)
-        )
-        ENGINE = MergeTree
-        PARTITION BY toDate(ts)
-        ORDER BY (src_db, src_table, key, seq)
+      )
+      ENGINE = MergeTree
+          PARTITION BY toDate(ts)
+          ORDER BY (seq, src_db, src_table, node_id);
     "#).execute().await.unwrap();
 
     // Tailer args + deterministic checkpoint
@@ -459,6 +464,7 @@ async fn wal_resume_from_checkpoint_using_helpers() {
         ch_url: ch_url.clone(),
         ch_database: "wal".into(),
         ch_table: "rdb_changelog".into(),
+        node_id: Some("node1".to_string())
     };
 
     // Phase 1: start tailer, ingest first batch
@@ -614,8 +620,9 @@ async fn wal_embedded_rocksdb_tuple_pk_end_to_end() {
 
     client.query("DROP TABLE IF EXISTS wal.rdb_changelog").execute().await.unwrap();
     client.query(r#"
-        CREATE TABLE wal.rdb_changelog
-        (
+      CREATE TABLE wal.rdb_changelog
+      (
+          node_id    String,
           src_db     String,
           src_table  String,
           ts         DateTime64(3) DEFAULT now64(3),
@@ -624,10 +631,10 @@ async fn wal_embedded_rocksdb_tuple_pk_end_to_end() {
           is_deleted UInt8,
           value_b64  Nullable(String),
           value_json Nullable(String)
-        )
-        ENGINE = MergeTree
-        PARTITION BY toDate(ts)
-        ORDER BY (src_db, src_table, key, seq)
+      )
+      ENGINE = MergeTree
+          PARTITION BY toDate(ts)
+          ORDER BY (seq, src_db, src_table, node_id);
     "#).execute().await.unwrap();
     
     let ckpt_dir = TempDir::new().unwrap();
@@ -641,6 +648,7 @@ async fn wal_embedded_rocksdb_tuple_pk_end_to_end() {
         ch_url: ch_url.clone(),
         ch_database: "wal".into(),
         ch_table: "rdb_changelog".into(),
+        node_id: Some("node1".to_string())
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

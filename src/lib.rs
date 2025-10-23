@@ -67,6 +67,24 @@ fn parse_ty(s: &str) -> Ty {
         _ => Ty::Unknown,
     }
 }
+
+#[cfg(unix)]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // SIGINT (Ctrl-C)
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    // SIGTERM (systemd stop)
+    let mut term = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term.recv() => {}
+    }
+    Ok(())
+}
+
 async fn load_schema(client: &Client, db: &str, tbl: &str) -> Result<TableSchema> {
     let cols: Vec<ColRow> = client
         .query("SELECT name, type, position FROM system.columns WHERE database=? AND table=? ORDER BY position")
@@ -162,25 +180,23 @@ fn parse_src(s: &str) -> std::result::Result<Src, String> {
     about = "Tail multiple EmbeddedRocksDB tables and stream WAL into ClickHouse"
 )]
 pub struct TailArgs {
-    /// One or more sources in form db.table | --src db1.t1,db2.t2
-    #[arg(long = "src", env = "SRC", value_parser = parse_src, num_args = 1.., value_delimiter = ','
-    )]
+    #[arg(long = "src", env = "SRC", value_parser = parse_src, num_args = 1.., value_delimiter = ',')]
     pub src: Vec<Src>,
 
-    /// Directory where per-source checkpoints will be stored (db__table.seq)
     #[arg(long, env = "CHECKPOINT_DIR", default_value = "wal_ckpts")]
     pub checkpoint_dir: PathBuf,
 
-    /// ClickHouse connection
     #[arg(long, env = "CH_URL")]
     pub ch_url: String,
 
-    /// Destination database & table
     #[arg(long, env = "CH_DATABASE", default_value = "wal")]
     pub ch_database: String,
 
     #[arg(long, env = "CH_TABLE", default_value = "rdb_changelog")]
     pub ch_table: String,
+
+    #[arg(long = "node-id", env = "NODE_ID")]
+    pub node_id: Option<String>,
 }
 
 #[repr(u8)]
@@ -232,15 +248,12 @@ impl<'a> WalEmitterCf<'a> {
 }
 impl<'a> WriteBatchIteratorCf for WalEmitterCf<'a> {
     fn put_cf(&mut self, cf: u32, key: &[u8], value: &[u8]) {
-        println!("put_cf: {:?}", encode_key(key));
         self.push(cf, Op::Put, key.into(), Some(value.into()));
     }
     fn merge_cf(&mut self, cf: u32, key: &[u8], value: &[u8]) {
-        println!("merge_cf: {:?}", encode_key(key));
         self.push(cf, Op::Merge, key.into(), Some(value.into()));
     }
     fn delete_cf(&mut self, cf: u32, key: &[u8]) {
-        println!("delete_cf: {:?}", encode_key(key));
         self.push(cf, Op::Delete, key.into(), None);
     }
 }
@@ -257,7 +270,6 @@ impl<'a> WalEmitterNoCf<'a> {
     fn push(&mut self, op: Op, key: Vec<u8>, value: Option<Vec<u8>>) {
         let seq = self.batch_first_seq.saturating_add(self.idx);
 
-        println!("push key in line 127: {:?}", key);
         self.buf.push(ChangelogRow {
             db: self.src_db.to_string(),
             table: self.src_table.to_string(),
@@ -282,6 +294,7 @@ impl<'a> WriteBatchIterator for WalEmitterNoCf<'a> {
 
 #[derive(Debug, Serialize, ChRow)]
 struct WalRow {
+    node_id: String,
     src_db: String,
     src_table: String,
     seq: u64,
@@ -296,12 +309,13 @@ fn fallback_key(raw: &[u8]) -> String {
         _ => format!("base64:{}", B64.encode(raw)),
     }
 }
-fn to_wal_row(r: ChangelogRow, schema: &TableSchema) -> WalRow {
+fn to_wal_row(r: ChangelogRow, schema: &TableSchema, node_id: &str) -> WalRow {
     let key_human = decode_key_human(&r.key, &schema.pk_ty).unwrap_or_else(|| fallback_key(&r.key));
     let is_del = matches!(r.op, Op::Delete | Op::DeleteRange) as u8;
     let value_b64 = r.value.as_ref().map(|v| B64.encode(v));
     let value_json = r.value.as_ref().and_then(|v| decode_values_json(v, &schema.vals));
     WalRow {
+        node_id: node_id.to_string(),
         src_db: r.db,
         src_table: r.table,
         seq: r.seq,
@@ -311,7 +325,19 @@ fn to_wal_row(r: ChangelogRow, schema: &TableSchema) -> WalRow {
         value_json,
     }
 }
+fn resolve_node_id(args: &TailArgs) -> String {
+    if let Some(s) = args.node_id.clone() { return s; }
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.is_empty() { return h; }
+    }
+    "unknown".to_string()
+}
 pub async fn run_many_until_ctrlc(args: TailArgs) -> Result<()> {
+    if args.src.is_empty() {
+        eprintln!("[wal-tailer] no --src provided; nothing to do");
+        return Ok(());
+    }
+
     let mut handles = Vec::with_capacity(args.src.len());
     let mut cancels = Vec::with_capacity(args.src.len());
 
@@ -319,31 +345,40 @@ pub async fn run_many_until_ctrlc(args: TailArgs) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         cancels.push(tx);
 
+        eprintln!("Sync starting for table: [{}.{}]", src.db, src.table);
+
         let args_clone = args.clone();
         let src_id = format!("{}.{}", src.db, src.table);
+
         let h = tokio::spawn(async move {
             match run_single_src(args_clone, src, Some(rx)).await {
                 Ok(()) => eprintln!("[{src_id}] exited cleanly"),
                 Err(e) => {
                     eprintln!("[{src_id}] ERROR: {:#}", e);
                     for (i, cause) in e.chain().skip(1).enumerate() {
-                        eprintln!("    caused by [{i}]: {}", cause);
+                        eprintln!("    caused by [{i}]: {cause}");
                     }
                 }
             }
         });
+
         handles.push(h);
     }
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
+
     for tx in cancels {
         let _ = tx.send(());
     }
+
     for h in handles {
         let _ = h.await;
     }
+
+    eprintln!("[wal-tailer] shutdown complete");
     Ok(())
 }
+
 fn load_checkpoint(path: &Path) -> Option<u64> {
     let s = fs::read_to_string(path).ok()?;
     s.trim().parse::<u64>().ok()
@@ -379,6 +414,7 @@ pub async fn run_single_src(
     src: Src,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
+    let node_id = resolve_node_id(&args);
     const SMALL_BATCH_ROWS: usize = 32;
     const MAX_APPEND_DELAY_MS: u64 = 150;
 
@@ -394,10 +430,7 @@ pub async fn run_single_src(
     secondary_dir.push(format!("{}_{}", &src.db, &src.table));
     std::fs::create_dir_all(&secondary_dir).ok();
 
-    let mut opts = Options::default();
-    opts.set_wal_ttl_seconds(6 * 3600);
-    opts.set_wal_size_limit_mb(4096);
-
+    let opts = Options::default();
     let db = DB::open_cf_as_secondary(&opts, &rocks_path, &secondary_dir, &cf_names)
         .with_context(|| format!("open_cf_as_secondary at {:?}", rocks_path))?;
     db.try_catch_up_with_primary().ok();
@@ -508,7 +541,6 @@ pub async fn run_single_src(
 
                     if emitted > 0 { appended = true; }
                     last_applied_seq = last_seq_in_batch;
-                    println!("last_applied_seq {:?}", last_applied_seq)
                 }
             }
         }
@@ -524,7 +556,7 @@ pub async fn run_single_src(
                 && last_append.elapsed() >= std::time::Duration::from_millis(MAX_APPEND_DELAY_MS))
         {
             let schema = load_schema(&writer, &src.db, &src.table).await?;
-            flush(&mut writer, &args.ch_table, &mut buf, &ckpt_path, last_applied_seq, &schema).await?;
+            flush(&mut writer, &args.ch_table, &mut buf, &ckpt_path, last_applied_seq, &schema, &node_id).await?;
             last_append = std::time::Instant::now();
         }
 
@@ -535,7 +567,7 @@ pub async fn run_single_src(
     println!("Buffer empty: {:?}", buf.is_empty());
     if !buf.is_empty() {
         let schema = load_schema(&writer, &src.db, &src.table).await?;
-        flush(&mut writer, &args.ch_table, &mut buf, &ckpt_path, last_applied_seq, &schema).await?;
+        flush(&mut writer, &args.ch_table, &mut buf, &ckpt_path, last_applied_seq, &schema, &node_id).await?;
         save_checkpoint(&ckpt_path, last_applied_seq).ok();
     }
 
@@ -568,9 +600,10 @@ async fn flush(
     ckpt_path: &Path,
     last_seq: u64,
     schema: &TableSchema,
+    node_id: &str,
 ) -> anyhow::Result<()> {
     if buf.is_empty() { return Ok(()); }
-    let rows: Vec<WalRow> = std::mem::take(buf).into_iter().map(|r| to_wal_row(r, schema)).collect();
+    let rows: Vec<WalRow> = std::mem::take(buf).into_iter().map(|r| to_wal_row(r, schema, node_id )).collect();
     eprintln!("[flush] inserting {} rows up to seq {}", rows.len(), last_seq);
     let mut insert = client.insert::<WalRow>(table)?;
     for r in &rows { insert.write(r).await?; }

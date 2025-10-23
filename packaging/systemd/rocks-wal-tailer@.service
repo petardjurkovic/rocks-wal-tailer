@@ -1,0 +1,21 @@
+[Unit]
+Description=Rocks WAL tailer (%i)
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+Requires=clickhouse-server.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sysconfig/rocks-wal-tailer
+ExecStart=/usr/bin/rocks-wal-tailer \
+  --src %i \
+  --checkpoint-dir ${CHECKPOINT_DIR} \
+  --ch-url ${CH_URL} \
+  --ch-database ${CH_DATABASE} \
+  --ch-table ${CH_TABLE} \
+  ${EXTRA_ARGS}
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
