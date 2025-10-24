@@ -605,9 +605,15 @@ async fn flush(
     if buf.is_empty() { return Ok(()); }
     let rows: Vec<WalRow> = std::mem::take(buf).into_iter().map(|r| to_wal_row(r, schema, node_id )).collect();
     eprintln!("[flush] inserting {} rows up to seq {}", rows.len(), last_seq);
-    let mut insert = client.insert::<WalRow>(table)?;
-    for r in &rows { insert.write(r).await?; }
-    insert.end().await?;
+
+    for chunk in rows.chunks(BATCH_ROWS) {
+        let mut inserter = client.insert::<WalRow>(table)?;
+        for r in chunk {
+            inserter.write(r).await?;
+        }
+        inserter.end().await?;
+    }
+
     save_checkpoint(ckpt_path, last_seq)?;
     Ok(())
 }
