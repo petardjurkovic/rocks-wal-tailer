@@ -1,3 +1,7 @@
 /target
 .idea
 dist
+.venv
+buid/
+wal_replay/build/
+wal_replay/rks_wal_replay.spec

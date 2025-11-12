@@ -690,7 +690,7 @@ pub async fn discover_rocksdb_dir(
         .query(q_old)
         .bind(db)
         .bind(table)
-        .fetch_optional::<SysRowOld>() // <-- and here
+        .fetch_optional::<SysRowOld>()
         .await
         .with_context(|| "query system.tables (data_path)")?
     {
