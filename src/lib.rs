@@ -7,12 +7,12 @@ use clickhouse::{Client, Row};
 use rocksdb::{Options, DB};
 use rocksdb::{WriteBatchIterator, WriteBatchIteratorCf};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::io;
-use serde_json::json;
 /// Flush thresholds
 const BATCH_ROWS: usize = 10_000;
 const BATCH_MS: u64 = 500;
@@ -28,7 +28,15 @@ pub struct Src {
 }
 
 #[derive(Debug, Clone)]
-enum Ty { I64, U64, I32, U32, Str, Tuple(Vec<Ty>), Unknown }
+enum Ty {
+    I64,
+    U64,
+    I32,
+    U32,
+    Str,
+    Tuple(Vec<Ty>),
+    Unknown,
+}
 
 #[derive(Debug, Clone)]
 struct TableSchema {
@@ -38,7 +46,11 @@ struct TableSchema {
 }
 
 #[derive(clickhouse::Row, serde::Deserialize)]
-struct ColRow { name: String, r#type: String, position: u64 }
+struct ColRow {
+    name: String,
+    r#type: String,
+    position: u64,
+}
 fn parse_ty(s: &str) -> Ty {
     let t = s.trim();
     match t {
@@ -48,20 +60,31 @@ fn parse_ty(s: &str) -> Ty {
         "UInt32" => Ty::U32,
         "String" => Ty::Str,
         _ if t.starts_with("Tuple(") && t.ends_with(')') => {
-            let inner = &t[6..t.len()-1];
+            let inner = &t[6..t.len() - 1];
             // split on commas at depth 0 (no nesting beyond one level for our tests)
             let mut parts = Vec::new();
             let mut cur = String::new();
             let mut depth = 0i32;
             for ch in inner.chars() {
                 match ch {
-                    '(' => { depth += 1; cur.push(ch); }
-                    ')' => { depth -= 1; cur.push(ch); }
-                    ',' if depth == 0 => { parts.push(cur.trim().to_string()); cur.clear(); }
+                    '(' => {
+                        depth += 1;
+                        cur.push(ch);
+                    }
+                    ')' => {
+                        depth -= 1;
+                        cur.push(ch);
+                    }
+                    ',' if depth == 0 => {
+                        parts.push(cur.trim().to_string());
+                        cur.clear();
+                    }
                     _ => cur.push(ch),
                 }
             }
-            if !cur.trim().is_empty() { parts.push(cur.trim().to_string()); }
+            if !cur.trim().is_empty() {
+                parts.push(cur.trim().to_string());
+            }
             Ty::Tuple(parts.into_iter().map(|p| parse_ty(&p)).collect())
         }
         _ => Ty::Unknown,
@@ -92,7 +115,9 @@ async fn load_schema(client: &Client, db: &str, tbl: &str) -> Result<TableSchema
         .fetch_all().await
         .context("load system.columns")?;
 
-    if cols.is_empty() { return Err(anyhow!("no columns for {}.{}", db, tbl)); }
+    if cols.is_empty() {
+        return Err(anyhow!("no columns for {}.{}", db, tbl));
+    }
 
     // EmbeddedRocksDB uses a single column as PK
     let pk_idx = cols.iter().position(|c| c.name == "key").unwrap_or(0);
@@ -101,18 +126,38 @@ async fn load_schema(client: &Client, db: &str, tbl: &str) -> Result<TableSchema
 
     let mut vals = Vec::new();
     for (i, c) in cols.iter().enumerate() {
-        if i == pk_idx { continue; }
+        if i == pk_idx {
+            continue;
+        }
         vals.push((c.name.clone(), parse_ty(&c.r#type)));
     }
-    Ok(TableSchema { pk_name: pk_col.name.clone(), pk_ty, vals })
+    Ok(TableSchema {
+        pk_name: pk_col.name.clone(),
+        pk_ty,
+        vals,
+    })
 }
 fn take<'a>(buf: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-    if buf.len() < n { None } else { let (h,t)=buf.split_at(n); *buf=t; Some(h) }
+    if buf.len() < n {
+        None
+    } else {
+        let (h, t) = buf.split_at(n);
+        *buf = t;
+        Some(h)
+    }
 }
-fn read_u64(buf: &mut &[u8]) -> Option<u64> { Some(u64::from_le_bytes(take(buf,8)?.try_into().ok()?)) }
-fn read_i64(buf: &mut &[u8]) -> Option<i64> { Some(i64::from_le_bytes(take(buf,8)?.try_into().ok()?)) }
-fn read_u32(buf: &mut &[u8]) -> Option<u32> { Some(u32::from_le_bytes(take(buf,4)?.try_into().ok()?)) }
-fn read_i32(buf: &mut &[u8]) -> Option<i32> { Some(i32::from_le_bytes(take(buf,4)?.try_into().ok()?)) }
+fn read_u64(buf: &mut &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(take(buf, 8)?.try_into().ok()?))
+}
+fn read_i64(buf: &mut &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(take(buf, 8)?.try_into().ok()?))
+}
+fn read_u32(buf: &mut &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(take(buf, 4)?.try_into().ok()?))
+}
+fn read_i32(buf: &mut &[u8]) -> Option<i32> {
+    Some(i32::from_le_bytes(take(buf, 4)?.try_into().ok()?))
+}
 fn read_varu64(buf: &mut &[u8]) -> Option<u64> {
     let mut x = 0u64;
     let mut s = 0u32;
@@ -188,6 +233,9 @@ pub struct TailArgs {
 
     #[arg(long, env = "CH_URL")]
     pub ch_url: String,
+
+    #[arg(long, env = "LOCAL_CH_URL", default_value = "http://127.0.0.1:8123")]
+    pub local_ch_url: String,
 
     #[arg(long, env = "CH_DATABASE", default_value = "wal")]
     pub ch_database: String,
@@ -305,7 +353,12 @@ struct WalRow {
 }
 fn fallback_key(raw: &[u8]) -> String {
     match std::str::from_utf8(raw) {
-        Ok(s) if s.chars().all(|c| !c.is_control() || matches!(c, '\n'|'\r'|'\t')) => s.to_string(),
+        Ok(s)
+            if s.chars()
+                .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) =>
+        {
+            s.to_string()
+        }
         _ => format!("base64:{}", B64.encode(raw)),
     }
 }
@@ -313,7 +366,10 @@ fn to_wal_row(r: ChangelogRow, schema: &TableSchema, node_id: &str) -> WalRow {
     let key_human = decode_key_human(&r.key, &schema.pk_ty).unwrap_or_else(|| fallback_key(&r.key));
     let is_del = matches!(r.op, Op::Delete | Op::DeleteRange) as u8;
     let value_b64 = r.value.as_ref().map(|v| B64.encode(v));
-    let value_json = r.value.as_ref().and_then(|v| decode_values_json(v, &schema.vals));
+    let value_json = r
+        .value
+        .as_ref()
+        .and_then(|v| decode_values_json(v, &schema.vals));
     WalRow {
         node_id: node_id.to_string(),
         src_db: r.db,
@@ -326,9 +382,13 @@ fn to_wal_row(r: ChangelogRow, schema: &TableSchema, node_id: &str) -> WalRow {
     }
 }
 fn resolve_node_id(args: &TailArgs) -> String {
-    if let Some(s) = args.node_id.clone() { return s; }
+    if let Some(s) = args.node_id.clone() {
+        return s;
+    }
     if let Ok(h) = std::env::var("HOSTNAME") {
-        if !h.is_empty() { return h; }
+        if !h.is_empty() {
+            return h;
+        }
     }
     "unknown".to_string()
 }
@@ -418,9 +478,10 @@ pub async fn run_single_src(
     const SMALL_BATCH_ROWS: usize = 32;
     const MAX_APPEND_DELAY_MS: u64 = 150;
 
-    let mut writer = clickhouse_client_for(&args)?;
+    let mut sink = sink_client_for(&args)?;
+    let local = local_metadata_client_for(&args)?;
 
-    let rocks_path = discover_rocksdb_dir(&writer, &src.db, &src.table)
+    let rocks_path = discover_rocksdb_dir(&local, &src.db, &src.table)
         .await
         .with_context(|| format!("discover rocksdb_dir for {}.{}", src.db, src.table))?;
     let cf_names = list_or_default_cfs(&rocks_path);
@@ -539,7 +600,9 @@ pub async fn run_single_src(
                         );
                     }
 
-                    if emitted > 0 { appended = true; }
+                    if emitted > 0 {
+                        appended = true;
+                    }
                     last_applied_seq = last_seq_in_batch;
                 }
             }
@@ -555,8 +618,17 @@ pub async fn run_single_src(
             || (!buf.is_empty()
                 && last_append.elapsed() >= std::time::Duration::from_millis(MAX_APPEND_DELAY_MS))
         {
-            let schema = load_schema(&writer, &src.db, &src.table).await?;
-            flush(&mut writer, &args.ch_table, &mut buf, &ckpt_path, last_applied_seq, &schema, &node_id).await?;
+            let schema = load_schema(&local, &src.db, &src.table).await?;
+            flush(
+                &mut sink,
+                &args.ch_table,
+                &mut buf,
+                &ckpt_path,
+                last_applied_seq,
+                &schema,
+                &node_id,
+            )
+            .await?;
             last_append = std::time::Instant::now();
         }
 
@@ -566,8 +638,17 @@ pub async fn run_single_src(
     }
     println!("Buffer empty: {:?}", buf.is_empty());
     if !buf.is_empty() {
-        let schema = load_schema(&writer, &src.db, &src.table).await?;
-        flush(&mut writer, &args.ch_table, &mut buf, &ckpt_path, last_applied_seq, &schema, &node_id).await?;
+        let schema = load_schema(&local, &src.db, &src.table).await?;
+        flush(
+            &mut sink,
+            &args.ch_table,
+            &mut buf,
+            &ckpt_path,
+            last_applied_seq,
+            &schema,
+            &node_id,
+        )
+        .await?;
         save_checkpoint(&ckpt_path, last_applied_seq).ok();
     }
 
@@ -582,10 +663,21 @@ fn is_wal_gap<E: std::fmt::Display>(e: &E) -> bool {
         || s.contains("corrupt")
         || s.contains("recovered")
 }
-fn clickhouse_client_for(args: &TailArgs) -> Result<Client> {
+fn sink_client_for(args: &TailArgs) -> Result<Client> {
     let mut c = Client::default()
         .with_url(&args.ch_url)
         .with_database(&args.ch_database)
+        .with_user("default")
+        .with_password("default123");
+    if let (Ok(u), Ok(p)) = (std::env::var("CH_USER"), std::env::var("CH_PASSWORD")) {
+        c = c.with_user(u).with_password(p);
+    }
+    Ok(c)
+}
+fn local_metadata_client_for(args: &TailArgs) -> Result<Client> {
+    let mut c = Client::default()
+        .with_url(&args.local_ch_url)
+        .with_database("system")
         .with_user("default")
         .with_password("default123");
     if let (Ok(u), Ok(p)) = (std::env::var("CH_USER"), std::env::var("CH_PASSWORD")) {
@@ -602,9 +694,18 @@ async fn flush(
     schema: &TableSchema,
     node_id: &str,
 ) -> anyhow::Result<()> {
-    if buf.is_empty() { return Ok(()); }
-    let rows: Vec<WalRow> = std::mem::take(buf).into_iter().map(|r| to_wal_row(r, schema, node_id )).collect();
-    eprintln!("[flush] inserting {} rows up to seq {}", rows.len(), last_seq);
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<WalRow> = std::mem::take(buf)
+        .into_iter()
+        .map(|r| to_wal_row(r, schema, node_id))
+        .collect();
+    eprintln!(
+        "[flush] inserting {} rows up to seq {}",
+        rows.len(),
+        last_seq
+    );
 
     for chunk in rows.chunks(BATCH_ROWS) {
         let mut inserter = client.insert::<WalRow>(table)?;
