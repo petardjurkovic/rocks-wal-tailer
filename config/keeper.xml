@@ -1,0 +1,16 @@
+<clickhouse>
+    <keeper_server>
+        <tcp_port>2181</tcp_port>
+        <raft_configuration>
+            <server>
+                <id>1</id>
+                <hostname>ch1</hostname>
+                <port>9444</port>
+            </server>
+        </raft_configuration>
+
+        <server_id>1</server_id>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+    </keeper_server>
+</clickhouse>

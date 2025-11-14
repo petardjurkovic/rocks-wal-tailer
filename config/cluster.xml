@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+
+    <zookeeper>
+        <node>
+            <host>zk1</host>
+            <port>2181</port>
+        </node>
+    </zookeeper>
+
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+
+    <remote_servers>
+        <test_cluster>
+            <shard>
+                <replica>
+                    <host>ch1</host>
+                    <port>9000</port>
+                    <port>8123</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>ch2</host>
+                    <port>9000</port>
+                    <port>8123</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>ch3</host>
+                    <port>9000</port>
+                    <port>8123</port>
+                </replica>
+            </shard>
+        </test_cluster>
+    </remote_servers>
+</clickhouse>
