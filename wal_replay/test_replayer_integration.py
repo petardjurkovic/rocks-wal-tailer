@@ -8,7 +8,7 @@ from io import StringIO
 import pytest
 import clickhouse_connect
 
-CH_URL = os.getenv('CH_URL', 'http://127.0.0.1:8124')
+CH_URL = os.getenv('CH_URL', 'http://127.0.0.1:8123')
 CH_USER = os.getenv('CH_USER', 'default')
 CH_PASS = os.getenv('CH_PASS', 'default123')
 

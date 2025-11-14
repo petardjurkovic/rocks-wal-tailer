@@ -9,7 +9,7 @@ WAL_TABLE = os.getenv('WAL_TABLE', 'rdb_changelog')
 FILTER_SRC_DB = os.getenv('FILTER_SRC_DB')
 FILTER_SRC_TABLE = os.getenv('FILTER_SRC_TABLE')
 
-CH_URL = os.getenv('CH_URL', 'http://127.0.0.1:8123')
+CH_URL = os.getenv('CH_URL', 'http://127.0.0.1:8124')
 CH_USER = os.getenv('CH_USER', 'default')
 CH_PASS = os.getenv('CH_PASS', '')
 

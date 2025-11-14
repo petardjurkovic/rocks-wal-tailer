@@ -1,0 +1,21 @@
+[Unit]
+Description=RocksDB WAL tailer to ClickHouse
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clickhouse
+Group=clickhouse
+
+EnvironmentFile=-/etc/sysconfig/rocks-wal-tailer
+
+ExecStart=/usr/bin/rocks-wal-tailer
+
+Restart=always
+RestartSec=3
+
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

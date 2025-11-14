@@ -1,22 +1,17 @@
-# Global defaults. Per-instance overrides go in /etc/sysconfig/rocks-wal-tailer-<instance>
-
-# Example:
-# SRC="srcdb.kv,srcdb.other"
-SRC="srcdb.kv"
-
-# ClickHouse HTTP endpoint
+# REQUIRED: ClickHouse HTTP endpoint that receives WAL changelog
 CH_URL="http://127.0.0.1:8123"
 
-# Optional auth (your binary already reads CH_USER/CH_PASSWORD envs)
-CH_USER="default"
-CH_PASSWORD="default123"
+# REQUIRED: Which EmbeddedRocksDB tables to tail
+# Example: SRC="srcdb.kv_tuple"
+SRC="srcdb.kv_tuple"
 
-# Destination
+CHECKPOINT_DIR="/var/lib/rocks-wal-tailer/ckpts"
+
+# Destination changelog table in ClickHouse
 CH_DATABASE="wal"
 CH_TABLE="rdb_changelog"
 
-# Where checkpoints live (per-instance default below)
-CHECKPOINT_DIR="/var/lib/rocks-wal-tailer/%i"
+NODE_ID="node1"
 
-# Node identifier (overrides --node-id in the binary if set)
-NODE_ID="$(hostname -f 2>/dev/null || hostname)"
+CH_USER="default"
+CH_PASSWORD="default123"

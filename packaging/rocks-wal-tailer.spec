@@ -21,7 +21,7 @@ Requires(postun): systemd
 
 %description
 Tails ClickHouse EmbeddedRocksDB write-ahead-logs and streams changes into a
-ClickHouse changelog table. Ships with a systemd templated unit.
+ClickHouse changelog table. Ships with a systemd service unit.
 
 %prep
 %setup -q
@@ -33,8 +33,8 @@ cargo build --release --locked
 install -D -m0755 target/release/rocks-wal-tailer \
   %{buildroot}%{_bindir}/rocks-wal-tailer
 
-install -D -m0644 packaging/systemd/rocks-wal-tailer@.service \
-  %{buildroot}%{_unitdir}/rocks-wal-tailer@.service
+install -D -m0644 packaging/systemd/rocks-wal-tailer.service \
+  %{buildroot}%{_unitdir}/rocks-wal-tailer.service
 
 install -D -m0644 packaging/sysconfig/rocks-wal-tailer \
   %{buildroot}%{_sysconfdir}/sysconfig/rocks-wal-tailer
@@ -47,16 +47,16 @@ exit 0
 
 %post
 %tmpfiles_create %{_tmpfilesdir}/rocks-wal-tailer.conf
-%systemd_post rocks-wal-tailer@.service
+%systemd_post rocks-wal-tailer.service
 
 %preun
-%systemd_preun rocks-wal-tailer@.service
+%systemd_preun rocks-wal-tailer.service
 
 %postun
-%systemd_postun_with_restart rocks-wal-tailer@.service
+%systemd_postun_with_restart rocks-wal-tailer.service
 
 %files
 %{_bindir}/rocks-wal-tailer
-%{_unitdir}/rocks-wal-tailer@.service
+%{_unitdir}/rocks-wal-tailer.service
 %config(noreplace) %{_sysconfdir}/sysconfig/rocks-wal-tailer
 %{_tmpfilesdir}/rocks-wal-tailer.conf

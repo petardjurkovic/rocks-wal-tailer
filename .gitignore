@@ -4,5 +4,4 @@ dist
 .venv
 buid/
 wal_replay/build/
-wal_replay/rks_wal_replay.spec
- wal_replay/__pycache__/
+wal_replay/__pycache__/
