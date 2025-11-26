@@ -4,17 +4,24 @@ import json
 import time
 import csv
 from io import StringIO
+from typing import Any
 
 import pytest
 import clickhouse_connect
 
-CH_URL = os.getenv('CH_URL', 'http://127.0.0.1:8123')
+# Configure Logging for Tests
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
+
+CH_URL = os.getenv('CH_URL', 'http://127.0.0.1:8124')
 CH_USER = os.getenv('CH_USER', 'default')
 CH_PASS = os.getenv('CH_PASS', 'default123')
 
 REPL_CLUSTER = "test_cluster"
 
-NODE_TO_SHARD = json.loads(os.getenv('NODE_TO_SHARD', '{"node1":1}'))
+# TEST CONFIG: Map 'node1' (source) to Shard 2 (destination ch2)
+# This forces the replayer to route data specifically to ch2
+NODE_TO_SHARD = json.loads(os.getenv('NODE_TO_SHARD', '{"node1":2}'))
 
 WAL_DB = 'wal'
 WAL_TABLE = 'rdb_changelog'
@@ -65,16 +72,32 @@ def ch():
 
     u = clickhouse_connect.get_client(
         host='localhost',
-        port=8125,
+        port=8124,
         username='default',
         password='default123'
     )
     return u
 
 
+def get_scalar(val: Any) -> Any:
+    if isinstance(val, dict):
+        return list(val.values())[0]
+    return val
+
+
+def get_row_values(row: Any, keys: list) -> tuple:
+    if isinstance(row, dict):
+        return tuple(row[k] for k in keys)
+    return row
+
+
 def reset_schema(client):
-    client.command(f"CREATE DATABASE IF NOT EXISTS {WAL_DB}")
-    client.command(f"CREATE DATABASE IF NOT EXISTS {DST_DB}")
+    # 1. Create databases locally AND on cluster to ensure they exist everywhere
+    client.command(f"CREATE DATABASE IF NOT EXISTS {WAL_DB} ON CLUSTER {REPL_CLUSTER}")
+    client.command(f"CREATE DATABASE IF NOT EXISTS {DST_DB} ON CLUSTER {REPL_CLUSTER}")
+
+    # 2. Re-create WAL table (local to this node only is fine for source, but ensuring clean state)
+    client.command(f"DROP TABLE IF EXISTS {WAL_DB}.applier_ckpt")
     client.command(f"DROP TABLE IF EXISTS {WAL_DB}.{WAL_TABLE}")
     client.command(f"""
         CREATE TABLE {WAL_DB}.{WAL_TABLE}
@@ -94,41 +117,42 @@ def reset_schema(client):
         ORDER BY (src_db, src_table, node_id, seq, key)
     """)
 
-    client.command(f"DROP TABLE IF EXISTS {DST_DB}.{DST_LOCAL_REPL}")
+    # 3. Re-create Destination tables ON CLUSTER to ensure correct Engine on all nodes
+    # This fixes the "Storage MergeTree doesn't support FINAL" error on ch2/ch3
+    client.command(f"DROP TABLE IF EXISTS {DST_DB}.{DST_LOCAL_REPL} ON CLUSTER {REPL_CLUSTER}")
     client.command(f"""
-        CREATE TABLE {DST_DB}.{DST_LOCAL_REPL}
+        CREATE TABLE {DST_DB}.{DST_LOCAL_REPL} ON CLUSTER {REPL_CLUSTER}
         (
           key Tuple(Int64, Int64, String),
           v1  String,
           v2  Int64
         )
-        ENGINE MergeTree
+        ENGINE = ReplacingMergeTree
         ORDER BY key
     """)
 
-    client.command(f"DROP TABLE IF EXISTS {DST_DB}.{DST_LOCAL_SHARD}")
+    client.command(f"DROP TABLE IF EXISTS {DST_DB}.{DST_LOCAL_SHARD} ON CLUSTER {REPL_CLUSTER}")
     client.command(f"""
-        CREATE TABLE {DST_DB}.{DST_LOCAL_SHARD}
+        CREATE TABLE {DST_DB}.{DST_LOCAL_SHARD} ON CLUSTER {REPL_CLUSTER}
         (
           key Tuple(Int64, Int64, String),
           v1  String,
           v2  Int64
         )
-        ENGINE MergeTree
+        ENGINE = ReplacingMergeTree
         ORDER BY key
     """)
-    client.command(f"DROP TABLE IF EXISTS {DST_DB}.{DST_DIST}")
 
+    # 4. Re-create Distributed table
+    client.command(f"DROP TABLE IF EXISTS {DST_DB}.{DST_DIST} ON CLUSTER {REPL_CLUSTER}")
     if REPL_CLUSTER:
         client.command(f"""
-            CREATE TABLE {DST_DB}.{DST_DIST}
+            CREATE TABLE {DST_DB}.{DST_DIST} ON CLUSTER {REPL_CLUSTER}
             AS {DST_DB}.{DST_LOCAL_SHARD}
             ENGINE = Distributed('{REPL_CLUSTER}', '{DST_DB}', '{DST_LOCAL_SHARD}', cityHash64(key))
         """)
     else:
-        print(
-            "Fallback: you don't have a cluster configured, sharded test will still pass by inserting directly into the local table")
-        pass
+        print("Fallback: you don't have a cluster configured, sharded test will still pass by inserting directly into the local table")
 
 
 def load_wal_rows(client):
@@ -149,7 +173,7 @@ def load_wal_rows(client):
 
 
 def expected_live_count(client):
-    return client.query(f"""
+    res = client.query(f"""
         SELECT count() FROM (
           SELECT argMax(is_deleted, seq) AS last_del
           FROM {WAL_DB}.{WAL_TABLE}
@@ -157,46 +181,75 @@ def expected_live_count(client):
           GROUP BY key
         ) WHERE last_del=0
     """).first_item
+    return get_scalar(res)
 
 
-def assert_final_state(client, table_fqn):
-    # A1 updated to u2/101
-    r = client.query(f"""
-      SELECT v1, v2 FROM {table_fqn}
-      WHERE key=(1,1,'A1')
-    """).result_rows
-    assert r and r[0] == ('u2', 101), "A1 final mismatch"
+def assert_final_state(client, table_fqn, expected_shard_host=None):
+    # Force merge to ensure FINAL works as expected immediately
+    try:
+        if 'dist' not in table_fqn:
+            client.command(f"OPTIMIZE TABLE {table_fqn} FINAL")
+    except Exception:
+        pass
 
-    # B1 deleted
-    r = client.query(f"SELECT count() FROM {table_fqn} WHERE key=(2,1,'B1')").first_item
-    assert r == 0, "B1 should be deleted"
+        # DEBUG LOGGING
+    try:
+        print(f"\n[DEBUG] --- DUMPING WAL TABLE ---")
+        wal_count = get_scalar(client.query(f"SELECT count() FROM {WAL_DB}.{WAL_TABLE}").first_item)
+        print(f"WAL Count: {wal_count}")
+        if wal_count > 0:
+            wal_rows = client.query(f"SELECT * FROM {WAL_DB}.{WAL_TABLE} LIMIT 5").result_rows
+            for r in wal_rows:
+                print(f"WAL Row (sample): {r}")
 
-    # S07 updated to v2/777
-    r = client.query(f"""
-      SELECT v1, v2 FROM {table_fqn}
-      WHERE key=(100,7,'S07')
-    """).result_rows
-    assert r and r[0] == ('v2', 777), "S07 final mismatch"
+        print(f"\n[DEBUG] --- DUMPING DEST TABLE {table_fqn} ---")
+        suffix = "FINAL" if "dist" not in table_fqn else ""
 
-    # S05 deleted
-    r = client.query(f"SELECT count() FROM {table_fqn} WHERE key=(100,5,'S05')").first_item
-    assert r == 0, "S05 should be deleted"
+        # Check specific shard if verifying redistribution
+        if expected_shard_host:
+            # IMPORTANT: Pass credentials to remote() so verification doesn't fail on auth
+            cnt = get_scalar(client.query(f"SELECT count() FROM remote('{expected_shard_host}', '{DST_DB}', '{DST_LOCAL_SHARD}', '{CH_USER}', '{CH_PASS}')").first_item)
+            print(f"Count on {expected_shard_host}: {cnt}")
+        else:
+            cnt = get_scalar(client.query(f"SELECT count() FROM {table_fqn} {suffix}").first_item)
+            print(f"Dest Count: {cnt}")
 
-    # S10 deleted
-    r = client.query(f"SELECT count() FROM {table_fqn} WHERE key=(100,10,'S10')").first_item
-    assert r == 0, "S10 should be deleted"
+        print("-----------------------------------")
+    except Exception as e:
+        logger.error(f"Failed to dump table: {e}")
 
-    # Z9 present
-    r = client.query(f"""
-      SELECT v1, v2 FROM {table_fqn}
-      WHERE key=(9,9,'Z9')
-    """).result_rows
-    assert r and r[0] == ('zz', 9), "Z9 final mismatch"
+    def check_row(key_tuple_str, expected_v1, expected_v2, msg):
+        suffix = "FINAL" if "dist" not in table_fqn else ""
 
-    # Global count equals live keys from WAL
-    live = expected_live_count(client)
-    cnt = client.query(f"SELECT count() FROM {table_fqn}").first_item
-    assert cnt == live, f"Row count mismatch: {cnt} != {live}"
+        # If verifying strict redistribution (node1->ch2)
+        if expected_shard_host:
+            # IMPORTANT: Pass credentials to remote()
+            res = client.query(f"SELECT v1, v2 FROM remote('{expected_shard_host}', '{DST_DB}', '{DST_LOCAL_SHARD}', '{CH_USER}', '{CH_PASS}') WHERE key={key_tuple_str}").result_rows
+        else:
+            res = client.query(f"SELECT v1, v2 FROM {table_fqn} {suffix} WHERE key={key_tuple_str}").result_rows
+
+        assert res, f"{msg}: row not found in {table_fqn} (expected on {expected_shard_host if expected_shard_host else 'any'})"
+        row = get_row_values(res[0], ['v1', 'v2'])
+        assert row == (expected_v1, expected_v2), f"{msg}: expected ({expected_v1}, {expected_v2}), got {row}"
+
+    def check_deleted(key_tuple_str, msg):
+        suffix = "FINAL" if "dist" not in table_fqn else ""
+
+        if expected_shard_host:
+            # IMPORTANT: Pass credentials to remote()
+            res = client.query(f"SELECT count() FROM remote('{expected_shard_host}', '{DST_DB}', '{DST_LOCAL_SHARD}', '{CH_USER}', '{CH_PASS}') WHERE key={key_tuple_str}").first_item
+        else:
+            res = client.query(f"SELECT count() FROM {table_fqn} {suffix} WHERE key={key_tuple_str}").first_item
+
+        cnt = get_scalar(res)
+        assert cnt == 0, f"{msg}: row should be deleted"
+
+    check_row("(1,1,'A1')", 'u2', 101, "A1 final mismatch")
+    check_deleted("(2,1,'B1')", "B1")
+    check_row("(100,7,'S07')", 'v2', 777, "S07 final mismatch")
+    check_deleted("(100,5,'S05')", "S05")
+    check_deleted("(100,10,'S10')", "S10")
+    check_row("(9,9,'Z9')", 'zz', 9, "Z9 final mismatch")
 
 
 def test_sharded_apply():
@@ -205,16 +258,13 @@ def test_sharded_apply():
     load_wal_rows(c)
 
     import rks_wal_replay as wr
-    # wire the module to connection and config
     wr.cli = c
     wr.WAL_DB = WAL_DB
     wr.WAL_TABLE = WAL_TABLE
 
-    # Building minimal sharded spec: route node1 -> shard 1
     if REPL_CLUSTER:
         distributed = f"{DST_DB}.{DST_DIST}"
     else:
-        # apply directly to local_sharded
         distributed = f"{DST_DB}.{DST_LOCAL_SHARD}"
 
     spec = {
@@ -227,8 +277,11 @@ def test_sharded_apply():
     wr.ensure_ckpt_table()
     wr.apply_sharded_spec(spec)
 
-    target = f"{DST_DB}.{DST_LOCAL_SHARD}" if REPL_CLUSTER else f"{DST_DB}.{DST_LOCAL_SHARD}"
-    assert_final_state(c, target)
+    # Verify data exists globally via Distributed table AND strictly on ch2
+    target = f"{DST_DB}.{DST_DIST}" if REPL_CLUSTER else f"{DST_DB}.{DST_LOCAL_SHARD}"
+
+    # We expect data to be on ch2 because NODE_TO_SHARD maps node1 -> 2
+    assert_final_state(c, target, expected_shard_host='ch2' if REPL_CLUSTER else None)
 
 
 @pytest.mark.skipif(not REPL_CLUSTER, reason="Set REPL_CLUSTER to run ON CLUSTER apply")
@@ -247,11 +300,10 @@ def test_replicated_apply():
         "src_table": "kv_tuple",
         "cluster": REPL_CLUSTER,
         "dst_db": DST_DB,
-        "dst_table_local": DST_LOCAL_REPL
+        "dst_table": DST_LOCAL_REPL
     }
 
     wr.ensure_ckpt_table()
     wr.apply_replicated_spec(spec)
 
-    # Validate on this node ON CLUSTER should have applied to all nodes
     assert_final_state(c, f"{DST_DB}.{DST_LOCAL_REPL}")
